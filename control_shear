@@ -1,0 +1,232 @@
+import numpy as np
+from scipy.linalg import solve_banded
+from scipy.optimize import brentq
+import matplotlib.pyplot as plt
+
+# -------------------------
+# Parâmetros físicos
+# -------------------------
+L = 1.0
+kappa = 5/6
+l = 0.0508
+h = 0.0031
+A = l * h
+rho = 2770.0
+rho1 = rho * A
+alpha = 10**3
+mu1 = 1.0
+mu2 = 1.0
+
+# -------------------------
+# Malha e tempo
+# -------------------------
+Nx = 200            # número de células (pontos internos = Nx-1)
+x = np.linspace(0, L, Nx+1)   # pontos de 0..Nx
+dx = x[1] - x[0]
+
+T = 5
+dt = 0.0008         # reduza se instável; CFL-like condition required
+Nt = int(np.round(T / dt))
+times = np.linspace(0, T, Nt+1)
+
+# -------------------------
+# Condições iniciais phi, phi_t, psi0 (se necessário)
+# -------------------------
+def phi0_func(x):
+    return 0.5 * np.exp(-200*(x - 0.4)**2)
+
+def phi1_func(x):
+    return np.zeros_like(x)
+
+# inicializações
+phi = phi0_func(x)            # deslocamento em todos pontos
+phi_t = phi1_func(x)          # velocidade
+# psi inicial: vamos resolver ellipticamente com u=0 para t=0
+u_prev = 0.0
+
+# montaremos matriz para o problema elíptico -psi_xx + kappa psi = -kappa phi_x
+# com Neumann psi_x(0)=psi_x(L)=u (u dado)
+# discretização: pontos j=0..Nx
+# interior j=1..Nx-1: - (psi_{j-1}-2psi_j+psi_{j+1})/dx^2 + kappa psi_j + kappa phi_x_j = 0
+# Neumann em extremos tratado com pontos imaginários (ghost points) usando psi_{-1}=psi_1 - 2 dx u (derivada aprox)
+# e psi_{Nx+1}=psi_{Nx-1} + 2 dx u
+
+# Precomputar operator banded para o sistema A psi = rhs(u)
+# A depende de kappa e dx, mas não de u (apenas RHS tem termos com u)
+N = Nx + 1  # número total de nós
+# Matriz tridiagonal para A: a_jj = 2/dx^2 + kappa, a_j,j-1 = a_j,j+1 = -1/dx^2
+diag = np.zeros(N)
+off = np.zeros(N-1)
+diag[:] = 2.0 / dx**2 + kappa
+off[:] = -1.0 / dx**2
+
+# Porém, pelas condições de Neumann com ghost points, as primeiras e últimas linhas se alteram:
+# para j=0: (-psi_{-1} + 2 psi_0 - psi_1)/dx^2 + kappa psi_0 + kappa phi_x_0 = 0
+# substituindo psi_{-1} = psi_1 - 2 dx u => - (psi_1 - 2 dx u) + 2 psi_0 - 2 psi_1 = 2 dx u + 2 psi_0 - 2 psi_1
+# isto dá coefes modificados: a_00 = 2/dx^2 + kappa, a_01 = -2/dx^2  (note fator 2)
+# análogo para última linha
+# Então ajustamos off-diagonais na primeira e última linhas.
+
+A_diag = diag.copy()
+A_off = off.copy()
+A_off_first = -2.0 / dx**2
+A_off_last  = -2.0 / dx**2
+A_off_build = A_off.copy()
+A_off_build[0] = A_off_first
+A_off_build[-1] = A_off_last
+
+# Construir matriz banda para solve_banded (upper+lower = 1)
+# forma (3, N): [upper, diag, lower]
+ab = np.zeros((3, N))
+ab[0,1:] = A_off_build  # upper diag (a_{i,i+1})
+ab[1,:]  = A_diag       # main diag
+ab[2,:-1]= A_off_build  # lower diag (a_{i,i-1})
+
+# função que monta RHS dado phi e u
+def build_rhs_phi(phi, u):
+    # phi_x no esquema central, dimension N nós
+    phi_x = np.zeros_like(phi)
+    # interior
+    phi_x[1:-1] = (phi[2:] - phi[:-2]) / (2.0*dx)
+    # fronteiras: usar diferenças unilaterais
+    phi_x[0] = (phi[1]-phi[0]) / dx
+    phi_x[-1] = (phi[-1]-phi[-2]) / dx
+
+    # RHS interno: -kappa * phi_x_j
+    rhs = - kappa * phi_x.copy()
+    # ajustar termos das condições de Neumann: aparecem como + 2 u / dx * (1/dx) ? vamos derivar direto:
+    # para j=0: uso expansão com psi_{-1}=psi_1 - 2 dx u, ao montar RHS constante teremos termo 2 u / dx
+    # derivação rápida: substituição gera termo + 2 u / dx
+    rhs[0] += 2.0 * u / dx
+    rhs[-1] -= 2.0 * u / dx   # sinal oposto na última equação (verificado via substituição)
+    return rhs
+
+# função que, para dado phi e u, resolve psi
+def solve_psi_for_u(phi, u):
+    rhs = build_rhs_phi(phi, u)
+    # solve banda
+    psi = solve_banded((1,1), ab, rhs)
+    return psi
+
+# função F(u) = (1/alpha) (psi(L)-psi(0)) - u
+def F_of_u(u, phi):
+    psi = solve_psi_for_u(phi, u)
+    return (1.0/alpha)*(psi[-1] - psi[0]) - u
+
+# resolver psi inicial com u_prev=0 por segurança
+psi = solve_psi_for_u(phi, u_prev)
+
+# Para avançar phi: esquema central explícito (segundo ordem)
+# phi^{n+1} = 2 phi^n - phi^{n-1} + dt^2 * (kappa/rho1) * ( (phi_x + psi)_x )
+# precisamos de phi^{n-1}; usar inicialização com phi_t
+phi_old = phi - dt * phi_t + 0.5 * dt**2 * np.zeros_like(phi)  # aproximação com aceleração inicial 0
+
+# armazenamento para saída
+save_every = max(1, Nt // 200)
+phis_record = []
+psis_record = []
+u_record = np.zeros(Nt+1)
+
+# loop temporal
+for k in range(Nt+1):
+    t = k*dt
+
+    # 1) encontrar u(t) resolvendo F(u)=0; usaremos intervalo de busca baseado em u_prev
+    # definir intervalo de busca razoável (ex: u_prev ± 10) e garantir mudança de sinal
+    u_lo = u_prev - 5.0
+    u_hi = u_prev + 5.0
+    # expandir intervalo até encontrar sinais opostos (com limite)
+    for _ in range(30):
+        f_lo = F_of_u(u_lo, phi)
+        f_hi = F_of_u(u_hi, phi)
+        if f_lo * f_hi < 0:
+            break
+        u_lo -= 2.0
+        u_hi += 2.0
+    # se não encontrar mudança de sinal, use newton-lite via brentq pode falhar; então usar fsolve-like fallback: fixe u = u_prev
+    try:
+        u_star = brentq(lambda uu: F_of_u(uu, phi), u_lo, u_hi, maxiter=100, xtol=1e-6)
+    except Exception:
+        # fallback: ponto fixo por poucas iterações
+        u_star = u_prev
+        for _ in range(5):
+            psi_tmp = solve_psi_for_u(phi, u_star)
+            u_star = (1.0/alpha)*(psi_tmp[-1] - psi_tmp[0])
+
+    u_prev = u_star
+    u_record[k] = u_star
+
+    # 2) resolver psi associado
+    psi = solve_psi_for_u(phi, u_star)
+
+    # 3) computar RHS: a = (kappa / rho1) * ( (phi_x + psi)_x )
+    # calcular phi_x + psi
+    temp = np.zeros_like(phi)
+    # phi_x por diferenças
+    temp[1:-1] = (phi[2:] - phi[:-2]) / (2.0*dx)
+    temp[0] = (phi[1]-phi[0]) / dx
+    temp[-1] = (phi[-1]-phi[-2]) / dx
+    temp = temp + psi  # (phi_x + psi)
+
+    # (phi_x + psi)_x pelo esquema central
+    dtemp_dx = np.zeros_like(temp)
+    dtemp_dx[1:-1] = (temp[2:] - temp[:-2]) / (2.0*dx)
+    dtemp_dx[0] = (temp[1] - temp[0]) / dx
+    dtemp_dx[-1] = (temp[-1] - temp[-2]) / dx
+
+    accel = (kappa / rho1) * dtemp_dx
+
+    # 4) avançar phi com esquema central
+    if k == 0:
+        # temos phi (n) e phi_old (aprox n-1)
+        phi_new = 2.0 * phi - phi_old + dt**2 * accel
+    else:
+        phi_new = 2.0 * phi - phi_old + dt**2 * accel
+
+    # atualizar históricos
+    phi_old = phi.copy()
+    phi = phi_new.copy()
+
+    # gravar
+    if k % save_every == 0 or k == Nt:
+        phis_record.append(phi.copy())
+        psis_record.append(psi.copy())
+
+# cálculo do custo J
+# J = 0.5 * ∫_0^L [mu1 phi^2(x,T) + mu2 phi_t^2(x,T)] dx + 0.5 * alpha ∫_0^T u^2 dt
+phi_T = phi.copy()
+# velocidade aproximada phi_t(T) ~ (phi(T) - phi_old)/dt
+phi_t_T = (phi_T - phi_old) / dt
+term1 = 0.5*( mu1 * np.trapz(phi_T**2, x) + mu2 * np.trapz(phi_t_T**2, x) )
+term2 = 0.5 * alpha * np.trapz(u_record**2, times)
+#term1 = 0.5 * ( mu1 * np.trapezoid(phi_T**2, x) + mu2 * np.trapezoid(phi_t_T**2, x) )
+#term2 = 0.5 * alpha * np.trapezoid(u_record**2, times)
+Jval = term1 + term2
+
+print("J(u) aproximado =", Jval)
+
+# Plots
+plt.figure(figsize=(10,4))
+plt.plot(times, u_record, lw=1)
+plt.xlabel("t"); plt.ylabel("u(t)"); plt.title("Control")
+plt.grid(True)
+
+# Define indices for plotting snapshots
+indices = np.linspace(0, Nt, 4, dtype=int)
+
+plt.figure(figsize=(10,8))
+for idx in indices:
+    plt.plot(x, phis_record[idx//save_every], label=f"t={times[idx]:.3f}")
+plt.xlabel("x")
+plt.ylabel("φ(x,t)")
+plt.title("Displacement φ(x,t)")
+plt.legend(); plt.grid(True)
+
+plt.figure(figsize=(10,8))
+for idx in indices:
+    plt.plot(x, psis_record[idx//save_every], label=f"t={times[idx]:.3f}")
+plt.xlabel("x")
+plt.ylabel("ψ(x,t)")
+plt.title("Displacement ψ(x,t)")
+plt.legend(); plt.grid(True)
+plt.show()
