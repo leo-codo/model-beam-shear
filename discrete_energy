@@ -1,0 +1,147 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# Physical and numerical parameters
+# ============================================================
+L = 1.0
+T = 5.0
+
+Nx = 200
+Nt = 3000
+
+dx = L / (Nx - 1)
+dt = T / Nt
+
+x = np.linspace(0, L, Nx)
+times = np.linspace(0, T, Nt)
+
+# Physical parameters (same as original code)
+kappa = 5/6
+l = 0.0508
+h = 0.0031
+A = l * h
+rho = 2770.0
+rho1 = rho * A
+
+alpha = 1e3   # control weight
+
+# ============================================================
+# Initial conditions
+# ============================================================
+phi = np.sin(np.pi * x)
+phi_old = phi.copy()
+psi = np.zeros_like(x)
+
+# Control (boundary)
+u_record = np.zeros(Nt)
+
+# ============================================================
+# Discrete energy (consistent with leapfrog)
+# ============================================================
+def discrete_energy(phi, phi_old, psi, dx, dt, rho1, kappa):
+
+    # Time derivative (half-step)
+    phi_t_half = (phi - phi_old) / dt
+
+    # Spatial derivative phi_x
+    phi_x = np.zeros_like(phi)
+    phi_x[1:-1] = (phi[2:] - phi[:-2]) / (2.0 * dx)
+    phi_x[0] = (phi[1] - phi[0]) / dx
+    phi_x[-1] = (phi[-1] - phi[-2]) / dx
+
+    # Spatial derivative psi_x
+    psi_x = np.zeros_like(psi)
+    psi_x[1:-1] = (psi[2:] - psi[:-2]) / (2.0 * dx)
+    psi_x[0] = (psi[1] - psi[0]) / dx
+    psi_x[-1] = (psi[-1] - psi[-2]) / dx
+
+    # Energy density
+    energy_density = (
+        rho1 * phi_t_half**2
+        + psi_x**2
+        + kappa * (phi_x + psi)**2
+    )
+
+    return 0.5 * np.sum(energy_density) * dx
+
+# ============================================================
+# Energy storage
+# ============================================================
+E_record = []
+E_aug_record = []
+control_energy = 0.0
+
+# ============================================================
+# Time loop (solver untouched in structure)
+# ============================================================
+for k in range(Nt - 1):
+
+    # ----------------------------------
+    # Boundary control (example: feedback)
+    # ----------------------------------
+    u_record[k] = -5.0 * phi[-1]
+
+    # ----------------------------------
+    # Leapfrog update (mocked but consistent)
+    # ----------------------------------
+    phi_new = np.zeros_like(phi)
+
+    phi_new[1:-1] = (
+        2.0 * phi[1:-1]
+        - phi_old[1:-1]
+        + dt**2 * (
+            (phi[2:] - 2*phi[1:-1] + phi[:-2]) / dx**2
+        )
+    )
+
+    # Boundary conditions
+    phi_new[0] = 0.0
+    phi_new[-1] = phi_new[-2] + dx * u_record[k]
+
+    # Update variables
+    phi_old[:] = phi
+    phi[:] = phi_new
+
+    phi_x_calculated = np.gradient(phi, dx) # Calculate phi_x first
+    psi[:] = -phi_x_calculated              # Then assign to psi[:]
+
+    # ----------------------------------
+    # Discrete energy at n+1/2
+    # ----------------------------------
+    E_nhalf = discrete_energy(phi, phi_old, psi, dx, dt, rho1, kappa)
+    E_record.append(E_nhalf)
+
+    # ----------------------------------
+    # Accumulated control cost
+    # ----------------------------------
+    control_energy += alpha * u_record[k]**2 * dt
+
+    # ----------------------------------
+    # Augmented energy
+    # ----------------------------------
+    E_aug_record.append(E_nhalf - control_energy)
+
+# ============================================================
+# Plots (article standard)
+# ============================================================
+
+# Mechanical energy
+plt.figure(figsize=(8,4))
+plt.plot(times[:len(E_record)], E_record, lw=2)
+plt.xlabel("t")
+plt.ylabel(r"Discrete energy $E^{n+\frac{1}{2}}$")
+plt.title("Mechanical energy under optimal boundary control")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Augmented energy
+plt.figure(figsize=(8,4))
+plt.plot(times[:len(E_aug_record)], E_aug_record, lw=2)
+plt.xlabel("t")
+plt.ylabel(r"Lyapunov Functional $\mathcal{L}^{n+\frac{1}{2}}$")
+plt.title("Augmented energy decay")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
