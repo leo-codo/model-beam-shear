@@ -1,232 +1,587 @@
 import numpy as np
-from scipy.linalg import solve_banded
-from scipy.optimize import brentq
 import matplotlib.pyplot as plt
+from scipy.linalg import solve_banded
 
-# -------------------------
-# Parâmetros físicos
-# -------------------------
+# ============================================================
+# PARAMETERS
+# ============================================================
+
 L = 1.0
-kappa = 5/6
-l = 0.0508
-h = 0.0031
-A = l * h
+T = 10.0
+
+Nx = 200
+Nt = 6250
+
+dx = L / Nx
+dt = T / Nt
+
+x = np.linspace(0.0, L, Nx + 1)
+t = np.linspace(0.0, T, Nt + 1)
+
+kappa = 5.0 / 6.0
+
+ell = 0.0508
+h_beam = 0.0031
+A = ell * h_beam
 rho = 2770.0
 rho1 = rho * A
-alpha = 10**3
+
+alpha = 1.0e1
 mu1 = 1.0
 mu2 = 1.0
 
-# -------------------------
-# Malha e tempo
-# -------------------------
-Nx = 200            # número de células (pontos internos = Nx-1)
-x = np.linspace(0, L, Nx+1)   # pontos de 0..Nx
-dx = x[1] - x[0]
+max_iter = 80
+tol_grad = 1.0e-6
+eta = 1.0 / alpha
+omega = 0.5
 
-T = 5
-dt = 0.0008         # reduza se instável; CFL-like condition required
-Nt = int(np.round(T / dt))
-times = np.linspace(0, T, Nt+1)
+use_relaxed_fixed_point = True
 
-# -------------------------
-# Condições iniciais phi, phi_t, psi0 (se necessário)
-# -------------------------
-def phi0_func(x):
-    return 0.5 * np.exp(-200*(x - 0.4)**2)
+# CFL check
+c_eff = np.sqrt(kappa / rho1)
+cfl = dt / dx * c_eff
 
-def phi1_func(x):
+print(f"rho1 = {rho1:.6e}")
+print(f"dx   = {dx:.6e}")
+print(f"dt   = {dt:.6e}")
+print(f"CFL  = {cfl:.6e}")
+
+if cfl >= 1.0:
+    print("WARNING: CFL condition may be violated.")
+
+
+# ============================================================
+# BUILD ELLIPTIC MATRIX FOR psi OR q
+# ============================================================
+
+def build_elliptic_banded(Nx, dx, kappa):
+    """
+    Builds banded matrix for the compatible elliptic discretization.
+
+    Unknowns: psi_0, ..., psi_Nx.
+    Matrix size: (Nx+1) x (Nx+1).
+
+    Returns ab for scipy.linalg.solve_banded((1,1), ab, rhs).
+    """
+
+    N = Nx + 1
+    ab = np.zeros((3, N))
+
+    # Left boundary row
+    # (-1/dx - k dx/4) psi_0 + (1/dx - k dx/4) psi_1 = rhs
+    ab[1, 0] = -1.0 / dx - kappa * dx / 4.0
+    ab[0, 1] =  1.0 / dx - kappa * dx / 4.0
+
+    # Interior rows
+    lower = -1.0 / dx**2 + kappa / 4.0
+    diag  =  2.0 / dx**2 + kappa / 2.0
+    upper = -1.0 / dx**2 + kappa / 4.0
+
+    for j in range(1, Nx):
+        ab[2, j - 1] = lower
+        ab[1, j]     = diag
+        ab[0, j + 1] = upper
+
+    # Right boundary row
+    # (-1/dx + k dx/4) psi_{N-1} + (1/dx + k dx/4) psi_N = rhs
+    ab[2, Nx - 1] = -1.0 / dx + kappa * dx / 4.0
+    ab[1, Nx]     =  1.0 / dx + kappa * dx / 4.0
+
+    return ab
+
+
+A_banded = build_elliptic_banded(Nx, dx, kappa)
+
+
+# ============================================================
+# ELLIPTIC SOLVER
+# ============================================================
+
+def solve_elliptic(phi, u_value, controlled=True):
+    """
+    Solves the elliptic equation for psi:
+        -psi_xx + kappa(phi_x + psi) = 0
+
+    If controlled=True, boundary RHS contains u_value.
+    If controlled=False, homogeneous adjoint boundary condition is used.
+    """
+
+    rhs = np.zeros(Nx + 1)
+
+    # Interior nodes
+    for j in range(1, Nx):
+        rhs[j] = -kappa * (phi[j + 1] - phi[j - 1]) / (2.0 * dx)
+
+    # Boundary conditions
+    if controlled:
+        rhs[0] = u_value + (kappa / 2.0) * (phi[1] - phi[0])
+        rhs[Nx] = u_value - (kappa / 2.0) * (phi[Nx] - phi[Nx - 1])
+    else:
+        rhs[0] = (kappa / 2.0) * (phi[1] - phi[0])
+        rhs[Nx] = -(kappa / 2.0) * (phi[Nx] - phi[Nx - 1])
+
+    return solve_banded((1, 1), A_banded, rhs)
+
+
+# ============================================================
+# INITIAL CONDITIONS
+# ============================================================
+
+def phi0_function(x):
+    # Option 1: energy validation
+    return np.sin(np.pi * x)
+
+    # Option 2: localized perturbation
+    # return 0.5 * np.exp(-200.0 * (x - 0.4)**2)
+
+
+def phi1_function(x):
     return np.zeros_like(x)
 
-# inicializações
-phi = phi0_func(x)            # deslocamento em todos pontos
-phi_t = phi1_func(x)          # velocidade
-# psi inicial: vamos resolver ellipticamente com u=0 para t=0
-u_prev = 0.0
 
-# montaremos matriz para o problema elíptico -psi_xx + kappa psi = -kappa phi_x
-# com Neumann psi_x(0)=psi_x(L)=u (u dado)
-# discretização: pontos j=0..Nx
-# interior j=1..Nx-1: - (psi_{j-1}-2psi_j+psi_{j+1})/dx^2 + kappa psi_j + kappa phi_x_j = 0
-# Neumann em extremos tratado com pontos imaginários (ghost points) usando psi_{-1}=psi_1 - 2 dx u (derivada aprox)
-# e psi_{Nx+1}=psi_{Nx-1} + 2 dx u
+# ============================================================
+# STATE SOLVER
+# ============================================================
 
-# Precomputar operator banded para o sistema A psi = rhs(u)
-# A depende de kappa e dx, mas não de u (apenas RHS tem termos com u)
-N = Nx + 1  # número total de nós
-# Matriz tridiagonal para A: a_jj = 2/dx^2 + kappa, a_j,j-1 = a_j,j+1 = -1/dx^2
-diag = np.zeros(N)
-off = np.zeros(N-1)
-diag[:] = 2.0 / dx**2 + kappa
-off[:] = -1.0 / dx**2
+def solve_state(u):
+    """
+    Forward solve of the state system for a given control u[n].
+    """
 
-# Porém, pelas condições de Neumann com ghost points, as primeiras e últimas linhas se alteram:
-# para j=0: (-psi_{-1} + 2 psi_0 - psi_1)/dx^2 + kappa psi_0 + kappa phi_x_0 = 0
-# substituindo psi_{-1} = psi_1 - 2 dx u => - (psi_1 - 2 dx u) + 2 psi_0 - 2 psi_1 = 2 dx u + 2 psi_0 - 2 psi_1
-# isto dá coefes modificados: a_00 = 2/dx^2 + kappa, a_01 = -2/dx^2  (note fator 2)
-# análogo para última linha
-# Então ajustamos off-diagonais na primeira e última linhas.
+    phi = np.zeros((Nt + 1, Nx + 1))
+    psi = np.zeros((Nt + 1, Nx + 1))
 
-A_diag = diag.copy()
-A_off = off.copy()
-A_off_first = -2.0 / dx**2
-A_off_last  = -2.0 / dx**2
-A_off_build = A_off.copy()
-A_off_build[0] = A_off_first
-A_off_build[-1] = A_off_last
+    phi[0, :] = phi0_function(x)
+    phi[0, 0] = 0.0
+    phi[0, -1] = 0.0
 
-# Construir matriz banda para solve_banded (upper+lower = 1)
-# forma (3, N): [upper, diag, lower]
-ab = np.zeros((3, N))
-ab[0,1:] = A_off_build  # upper diag (a_{i,i+1})
-ab[1,:]  = A_diag       # main diag
-ab[2,:-1]= A_off_build  # lower diag (a_{i,i-1})
+    psi[0, :] = solve_elliptic(phi[0, :], u[0], controlled=True)
 
-# função que monta RHS dado phi e u
-def build_rhs_phi(phi, u):
-    # phi_x no esquema central, dimension N nós
-    phi_x = np.zeros_like(phi)
-    # interior
-    phi_x[1:-1] = (phi[2:] - phi[:-2]) / (2.0*dx)
-    # fronteiras: usar diferenças unilaterais
-    phi_x[0] = (phi[1]-phi[0]) / dx
-    phi_x[-1] = (phi[-1]-phi[-2]) / dx
+    # Initial acceleration
+    acc0 = np.zeros(Nx + 1)
+    for j in range(1, Nx):
+        acc0[j] = (kappa / rho1) * (
+            (phi[0, j + 1] - 2.0 * phi[0, j] + phi[0, j - 1]) / dx**2
+            +
+            (psi[0, j + 1] - psi[0, j - 1]) / (2.0 * dx)
+        )
 
-    # RHS interno: -kappa * phi_x_j
-    rhs = - kappa * phi_x.copy()
-    # ajustar termos das condições de Neumann: aparecem como + 2 u / dx * (1/dx) ? vamos derivar direto:
-    # para j=0: uso expansão com psi_{-1}=psi_1 - 2 dx u, ao montar RHS constante teremos termo 2 u / dx
-    # derivação rápida: substituição gera termo + 2 u / dx
-    rhs[0] += 2.0 * u / dx
-    rhs[-1] -= 2.0 * u / dx   # sinal oposto na última equação (verificado via substituição)
-    return rhs
+    phi_minus = phi[0, :] - dt * phi1_function(x) + 0.5 * dt**2 * acc0
+    phi_minus[0] = 0.0
+    phi_minus[-1] = 0.0
 
-# função que, para dado phi e u, resolve psi
-def solve_psi_for_u(phi, u):
-    rhs = build_rhs_phi(phi, u)
-    # solve banda
-    psi = solve_banded((1,1), ab, rhs)
-    return psi
+    previous = phi_minus.copy()
 
-# função F(u) = (1/alpha) (psi(L)-psi(0)) - u
-def F_of_u(u, phi):
-    psi = solve_psi_for_u(phi, u)
-    return (1.0/alpha)*(psi[-1] - psi[0]) - u
+    for n in range(0, Nt):
+        psi[n, :] = solve_elliptic(phi[n, :], u[n], controlled=True)
 
-# resolver psi inicial com u_prev=0 por segurança
-psi = solve_psi_for_u(phi, u_prev)
+        next_phi = np.zeros(Nx + 1)
 
-# Para avançar phi: esquema central explícito (segundo ordem)
-# phi^{n+1} = 2 phi^n - phi^{n-1} + dt^2 * (kappa/rho1) * ( (phi_x + psi)_x )
-# precisamos de phi^{n-1}; usar inicialização com phi_t
-phi_old = phi - dt * phi_t + 0.5 * dt**2 * np.zeros_like(phi)  # aproximação com aceleração inicial 0
+        for j in range(1, Nx):
+            next_phi[j] = (
+                2.0 * phi[n, j]
+                - previous[j]
+                + (kappa * dt**2 / rho1)
+                * (
+                    (phi[n, j + 1] - 2.0 * phi[n, j] + phi[n, j - 1]) / dx**2
+                    +
+                    (psi[n, j + 1] - psi[n, j - 1]) / (2.0 * dx)
+                )
+            )
 
-# armazenamento para saída
-save_every = max(1, Nt // 200)
-phis_record = []
-psis_record = []
-u_record = np.zeros(Nt+1)
+        next_phi[0] = 0.0
+        next_phi[-1] = 0.0
 
-# loop temporal
-for k in range(Nt+1):
-    t = k*dt
+        if n < Nt:
+            previous = phi[n, :].copy()
+            if n + 1 <= Nt:
+                phi[n + 1, :] = next_phi
 
-    # 1) encontrar u(t) resolvendo F(u)=0; usaremos intervalo de busca baseado em u_prev
-    # definir intervalo de busca razoável (ex: u_prev ± 10) e garantir mudança de sinal
-    u_lo = u_prev - 5.0
-    u_hi = u_prev + 5.0
-    # expandir intervalo até encontrar sinais opostos (com limite)
-    for _ in range(30):
-        f_lo = F_of_u(u_lo, phi)
-        f_hi = F_of_u(u_hi, phi)
-        if f_lo * f_hi < 0:
-            break
-        u_lo -= 2.0
-        u_hi += 2.0
-    # se não encontrar mudança de sinal, use newton-lite via brentq pode falhar; então usar fsolve-like fallback: fixe u = u_prev
-    try:
-        u_star = brentq(lambda uu: F_of_u(uu, phi), u_lo, u_hi, maxiter=100, xtol=1e-6)
-    except Exception:
-        # fallback: ponto fixo por poucas iterações
-        u_star = u_prev
-        for _ in range(5):
-            psi_tmp = solve_psi_for_u(phi, u_star)
-            u_star = (1.0/alpha)*(psi_tmp[-1] - psi_tmp[0])
+    psi[Nt, :] = solve_elliptic(phi[Nt, :], u[Nt], controlled=True)
 
-    u_prev = u_star
-    u_record[k] = u_star
+    return phi, psi
 
-    # 2) resolver psi associado
-    psi = solve_psi_for_u(phi, u_star)
 
-    # 3) computar RHS: a = (kappa / rho1) * ( (phi_x + psi)_x )
-    # calcular phi_x + psi
-    temp = np.zeros_like(phi)
-    # phi_x por diferenças
-    temp[1:-1] = (phi[2:] - phi[:-2]) / (2.0*dx)
-    temp[0] = (phi[1]-phi[0]) / dx
-    temp[-1] = (phi[-1]-phi[-2]) / dx
-    temp = temp + psi  # (phi_x + psi)
+# ============================================================
+# ADJOINT SOLVER
+# ============================================================
 
-    # (phi_x + psi)_x pelo esquema central
-    dtemp_dx = np.zeros_like(temp)
-    dtemp_dx[1:-1] = (temp[2:] - temp[:-2]) / (2.0*dx)
-    dtemp_dx[0] = (temp[1] - temp[0]) / dx
-    dtemp_dx[-1] = (temp[-1] - temp[-2]) / dx
+def solve_adjoint(phi):
+    """
+    Backward solve of the adjoint system using terminal PMP conditions.
+    """
 
-    accel = (kappa / rho1) * dtemp_dx
+    p = np.zeros((Nt + 2, Nx + 1))
+    q = np.zeros((Nt + 1, Nx + 1))
 
-    # 4) avançar phi com esquema central
-    if k == 0:
-        # temos phi (n) e phi_old (aprox n-1)
-        phi_new = 2.0 * phi - phi_old + dt**2 * accel
+    # Terminal velocity approximation of state
+    #phi_t_T = (phi[Nt, :] - phi[Nt - 1, :]) / dt
+    phi_t_T = (
+    3.0 * phi[Nt, :]
+    - 4.0 * phi[Nt - 1, :]
+    + phi[Nt - 2, :]
+) / (2.0 * dt)
+
+    # Terminal condition
+    p[Nt, :] = -(mu2 / rho1) * phi_t_T
+    p[Nt, 0] = 0.0
+    p[Nt, -1] = 0.0
+
+    q[Nt, :] = solve_elliptic(p[Nt, :], 0.0, controlled=False)
+
+    # Artificial terminal level p^{N+1}
+    p_t_T = (mu1 / rho1) * phi[Nt, :]
+
+    acc_T = np.zeros(Nx + 1)
+    for j in range(1, Nx):
+        acc_T[j] = (kappa / rho1) * (
+            (p[Nt, j + 1] - 2.0 * p[Nt, j] + p[Nt, j - 1]) / dx**2
+            +
+            (q[Nt, j + 1] - q[Nt, j - 1]) / (2.0 * dx)
+        )
+
+    p[Nt + 1, :] = p[Nt, :] + dt * p_t_T + 0.5 * dt**2 * acc_T
+    p[Nt + 1, 0] = 0.0
+    p[Nt + 1, -1] = 0.0
+
+    # Backward time integration
+    for n in range(Nt, 0, -1):
+        q[n, :] = solve_elliptic(p[n, :], 0.0, controlled=False)
+
+        p_prev = np.zeros(Nx + 1)
+
+        for j in range(1, Nx):
+            p_prev[j] = (
+                2.0 * p[n, j]
+                - p[n + 1, j]
+                + (kappa * dt**2 / rho1)
+                * (
+                    (p[n, j + 1] - 2.0 * p[n, j] + p[n, j - 1]) / dx**2
+                    +
+                    (q[n, j + 1] - q[n, j - 1]) / (2.0 * dx)
+                )
+            )
+
+        p_prev[0] = 0.0
+        p_prev[-1] = 0.0
+        p[n - 1, :] = p_prev
+
+    q[0, :] = solve_elliptic(p[0, :], 0.0, controlled=False)
+
+    return p[:Nt + 1, :], q
+
+
+# ============================================================
+# DISCRETE COST FUNCTIONAL
+# ============================================================
+
+def compute_cost(phi, u):
+    phi_T = phi[Nt, :]
+    #phi_t_T = (phi[Nt, :] - phi[Nt - 1, :]) / dt
+    phi_t_T = (
+    3.0 * phi[Nt, :]
+    - 4.0 * phi[Nt - 1, :]
+    + phi[Nt - 2, :]
+) / (2.0 * dt)
+
+    terminal = 0.5 * dx * np.sum(mu1 * phi_T**2 + mu2 * phi_t_T**2)
+    control = 0.5 * alpha * dt * np.sum(u**2)
+
+    return terminal + control
+
+
+# ============================================================
+# DISCRETE ENERGY
+# ============================================================
+
+def compute_energy(phi, psi):
+    E = np.zeros(Nt)
+
+    for n in range(0, Nt):
+        v = (phi[n + 1, :] - phi[n, :]) / dt
+
+        kinetic = rho1 * np.sum(v[:-1]**2)
+
+        psi_x_np1 = (psi[n + 1, 1:] - psi[n + 1, :-1]) / dx
+        psi_x_n = (psi[n, 1:] - psi[n, :-1]) / dx
+
+        shear_np1 = (
+            (phi[n + 1, 1:] - phi[n + 1, :-1]) / dx
+            +
+            0.5 * (psi[n + 1, 1:] + psi[n + 1, :-1])
+        )
+
+        shear_n = (
+            (phi[n, 1:] - phi[n, :-1]) / dx
+            +
+            0.5 * (psi[n, 1:] + psi[n, :-1])
+        )
+
+        elastic_psi = np.sum(psi_x_np1 * psi_x_n)
+        elastic_shear = kappa * np.sum(shear_np1 * shear_n)
+
+        E[n] = 0.5 * dx * (kinetic + elastic_psi + elastic_shear)
+
+    return E
+
+
+# ============================================================
+# OPTIMIZATION LOOP
+# ============================================================
+
+u = np.zeros(Nt + 1)
+
+cost_history = []
+grad_history = []
+control_diff_history = []
+
+for k in range(max_iter):
+    print(f"\nIteration {k + 1}/{max_iter}")
+
+    phi, psi = solve_state(u)
+    p, q = solve_adjoint(phi)
+
+    grad = alpha * u - (q[:, -1] - q[:, 0])
+
+    grad_norm = np.sqrt(dt * np.sum(grad**2))
+    Jval = compute_cost(phi, u)
+
+    cost_history.append(Jval)
+    grad_history.append(grad_norm)
+
+    print(f"J(u)       = {Jval:.8e}")
+    print(f"||grad||   = {grad_norm:.8e}")
+
+    if grad_norm < tol_grad:
+        print("Convergence achieved.")
+        break
+
+    if use_relaxed_fixed_point:
+        u_new = (1.0 - omega) * u + omega * (q[:, -1] - q[:, 0]) / alpha
     else:
-        phi_new = 2.0 * phi - phi_old + dt**2 * accel
+        u_new = u - eta * grad
 
-    # atualizar históricos
-    phi_old = phi.copy()
-    phi = phi_new.copy()
+    control_diff = np.sqrt(dt * np.sum((u_new - u)**2))
+    control_diff_history.append(control_diff)
 
-    # gravar
-    if k % save_every == 0 or k == Nt:
-        phis_record.append(phi.copy())
-        psis_record.append(psi.copy())
+    print(f"||du||      = {control_diff:.8e}")
 
-# cálculo do custo J
-# J = 0.5 * ∫_0^L [mu1 phi^2(x,T) + mu2 phi_t^2(x,T)] dx + 0.5 * alpha ∫_0^T u^2 dt
-phi_T = phi.copy()
-# velocidade aproximada phi_t(T) ~ (phi(T) - phi_old)/dt
-phi_t_T = (phi_T - phi_old) / dt
-term1 = 0.5*( mu1 * np.trapz(phi_T**2, x) + mu2 * np.trapz(phi_t_T**2, x) )
-term2 = 0.5 * alpha * np.trapz(u_record**2, times)
-#term1 = 0.5 * ( mu1 * np.trapezoid(phi_T**2, x) + mu2 * np.trapezoid(phi_t_T**2, x) )
-#term2 = 0.5 * alpha * np.trapezoid(u_record**2, times)
-Jval = term1 + term2
+    u = u_new.copy()
 
-print("J(u) aproximado =", Jval)
 
-# Plots
-plt.figure(figsize=(10,4))
-plt.plot(times, u_record, lw=1)
-plt.xlabel("t"); plt.ylabel("u(t)"); plt.title("Control")
+# Final solve
+phi_opt, psi_opt = solve_state(u)
+p_opt, q_opt = solve_adjoint(phi_opt)
+E_opt = compute_energy(phi_opt, psi_opt)
+# ============================================================
+# CONTROLLED vs UNCONTROLLED COMPARISON
+# ============================================================
+
+# Uncontrolled solution: same initial conditions, u(t) = 0
+u_zero = np.zeros(Nt + 1)
+
+phi_free, psi_free = solve_state(u_zero)
+E_free = compute_energy(phi_free, psi_free)
+
+
+# ------------------------------------------------------------
+# Auxiliary functions for quantitative comparison
+# ------------------------------------------------------------
+
+def l2_space(v):
+    """
+    Discrete L2(0,L) norm using the trapezoidal rule.
+    """
+    return np.sqrt(
+        dx * (
+            0.5 * v[0]**2
+            + np.sum(v[1:-1]**2)
+            + 0.5 * v[-1]**2
+        )
+    )
+
+
+def terminal_velocity(phi):
+    """
+    Second-order backward approximation of phi_t(T).
+    """
+    return (
+        3.0 * phi[Nt, :]
+        - 4.0 * phi[Nt - 1, :]
+        + phi[Nt - 2, :]
+    ) / (2.0 * dt)
+
+
+def terminal_cost(phi):
+    """
+    Terminal part of the objective functional.
+    """
+    phi_T = phi[Nt, :]
+    phi_t_T = terminal_velocity(phi)
+
+    return 0.5 * (
+        mu1 * l2_space(phi_T)**2
+        + mu2 * l2_space(phi_t_T)**2
+    )
+
+
+# Terminal quantities
+phiT_free = phi_free[Nt, :]
+phiT_opt  = phi_opt[Nt, :]
+
+phi_tT_free = terminal_velocity(phi_free)
+phi_tT_opt  = terminal_velocity(phi_opt)
+
+norm_phi_free = l2_space(phiT_free)
+norm_phi_opt  = l2_space(phiT_opt)
+
+norm_vel_free = l2_space(phi_tT_free)
+norm_vel_opt  = l2_space(phi_tT_opt)
+
+JT_free = terminal_cost(phi_free)
+JT_opt  = terminal_cost(phi_opt)
+
+J_free = compute_cost(phi_free, u_zero)
+J_opt  = compute_cost(phi_opt, u)
+
+
+# Percentage reductions
+def reduction_percentage(controlled, uncontrolled):
+    if abs(uncontrolled) < 1.0e-14:
+        return np.nan
+    return 100.0 * (uncontrolled - controlled) / uncontrolled
+
+
+red_phi = reduction_percentage(norm_phi_opt, norm_phi_free)
+red_vel = reduction_percentage(norm_vel_opt, norm_vel_free)
+red_JT  = reduction_percentage(JT_opt, JT_free)
+red_E   = reduction_percentage(E_opt[-1], E_free[-1])
+
+
+# ------------------------------------------------------------
+# Print comparison
+# ------------------------------------------------------------
+
+print("\n" + "=" * 65)
+print("CONTROLLED vs UNCONTROLLED COMPARISON")
+print("=" * 65)
+
+print(f"{'||phi(T)||_L2':30s} "
+      f"uncontrolled = {norm_phi_free:.8e}   "
+      f"controlled = {norm_phi_opt:.8e}   "
+      f"reduction = {red_phi:.2f}%")
+
+print(f"{'||phi_t(T)||_L2':30s} "
+      f"uncontrolled = {norm_vel_free:.8e}   "
+      f"controlled = {norm_vel_opt:.8e}   "
+      f"reduction = {red_vel:.2f}%")
+
+print(f"{'Terminal cost':30s} "
+      f"uncontrolled = {JT_free:.8e}   "
+      f"controlled = {JT_opt:.8e}   "
+      f"reduction = {red_JT:.2f}%")
+
+print(f"{'Final discrete energy':30s} "
+      f"uncontrolled = {E_free[-1]:.8e}   "
+      f"controlled = {E_opt[-1]:.8e}   "
+      f"reduction = {red_E:.2f}%")
+
+print(f"{'Total cost J':30s} "
+      f"uncontrolled = {J_free:.8e}   "
+      f"controlled = {J_opt:.8e}")
+
+print("=" * 65)
+# ============================================================
+# PLOTS
+# ============================================================
+
+plt.figure(figsize=(8, 4))
+plt.plot(cost_history, marker="o")
+plt.xlabel("Iteration")
+plt.ylabel(r"$J_h(u^k)$")
+plt.title("Discrete cost functional")
 plt.grid(True)
+plt.tight_layout()
+plt.show()
 
-# Define indices for plotting snapshots
-indices = np.linspace(0, Nt, 4, dtype=int)
+plt.figure(figsize=(8, 4))
+plt.semilogy(grad_history, marker="o")
+plt.xlabel("Iteration")
+plt.ylabel(r"$\|g^k\|_{\ell^2_{\Delta t}}$")
+plt.title("Optimality residual")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
 
-plt.figure(figsize=(10,8))
-for idx in indices:
-    plt.plot(x, phis_record[idx//save_every], label=f"t={times[idx]:.3f}")
+plt.figure(figsize=(8, 4))
+plt.plot(t, u)
+plt.xlabel("Time")
+plt.ylabel(r"$u(t)$")
+plt.title("Optimal boundary control")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(8, 4))
+plt.plot(t[:-1], E_opt)
+plt.xlabel("Time")
+plt.ylabel(r"$E^n$")
+plt.title("Discrete mechanical energy")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(8, 4))
+plt.plot(x, phi_opt[0, :], label=r"$t=0$")
+plt.plot(x, phi_opt[Nt // 4, :], label=r"$t=T/4$")
+plt.plot(x, phi_opt[Nt // 2, :], label=r"$t=T/2$")
+plt.plot(x, phi_opt[-1, :], label=r"$t=T$")
 plt.xlabel("x")
-plt.ylabel("φ(x,t)")
-plt.title("Displacement φ(x,t)")
-plt.legend(); plt.grid(True)
+plt.ylabel(r"$\varphi(x,t)$")
+plt.title("Controlled displacement")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
 
-plt.figure(figsize=(10,8))
-for idx in indices:
-    plt.plot(x, psis_record[idx//save_every], label=f"t={times[idx]:.3f}")
+plt.figure(figsize=(8, 4))
+plt.plot(x, psi_opt[0, :], label=r"$t=0$")
+plt.plot(x, psi_opt[Nt // 4, :], label=r"$t=T/4$")
+plt.plot(x, psi_opt[Nt // 2, :], label=r"$t=T/2$")
+plt.plot(x, psi_opt[-1, :], label=r"$t=T$")
 plt.xlabel("x")
-plt.ylabel("ψ(x,t)")
-plt.title("Displacement ψ(x,t)")
-plt.legend(); plt.grid(True)
+plt.ylabel(r"$\psi(x,t)$")
+plt.title("Elliptic variable under optimal control")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# FINAL DISPLACEMENT: CONTROLLED vs UNCONTROLLED
+# ============================================================
+
+plt.figure(figsize=(8, 4))
+
+plt.plot(
+    x,
+    phi_free[-1, :],
+    linewidth=2,
+    label=r"Uncontrolled: $u(t)\equiv 0$"
+)
+
+plt.plot(
+    x,
+    phi_opt[-1, :],
+    linewidth=2,
+    linestyle="--",
+    label=r"Optimal control: $u(t)=u^*(t)$"
+)
+
+plt.xlabel(r"$x$")
+plt.ylabel(r"$\varphi(x,T)$")
+plt.title("Final displacement: controlled vs uncontrolled")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
 plt.show()
